@@ -1,7 +1,9 @@
 #!/usr/bin/env python
-
+import argparse
 import logging
+import os
 import queue
+import sys
 import threading
 import time
 from typing import Optional
@@ -9,77 +11,94 @@ from typing import Optional
 import psycopg2
 import psycopg2.extensions
 
-# Настройка логирования
-LOG_FORMAT = \
-    '%(asctime)-15s | %(levelname)-7s | %(filename)-25s:%(lineno)4s - %(funcName)25s() | %(message)s'
-logging.basicConfig(
-    level=logging.INFO,
-    # format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    format=LOG_FORMAT
-)
 
+# --- Функции для настройки логирования ---
+def setup_logging(level: str, log_file: Optional[str] = None):
+    """
+    Настраивает логирование в файл или на консоль.
+    :param level: Уровень логирования (например, 'DEBUG', 'INFO', 'WARNING', 'ERROR').
+    :param log_file: Путь к файлу лога. Если None, логи идут в консоль.
+    """
+    LOG_FORMAT = '%(asctime)-15s | %(levelname)-7s | %(filename)-25s:%(lineno)4s - \
+%(funcName)25s() | %(message)s'
+
+    # Преобразуем строковый уровень в константу logging
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
+
+    if not isinstance(numeric_level, int):
+        raise ValueError(f'Invalid log level: {level}')
+
+    handlers = []
+
+    if log_file:
+        # Создаем директорию для файла лога, если она не существует
+        log_dir = os.path.dirname(os.path.abspath(log_file))
+
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        handlers.append(logging.FileHandler(log_file, encoding='utf-8'))
+    else:
+        handlers.append(logging.StreamHandler(sys.stdout))  # По умолчанию в stdout
+
+    logging.basicConfig(
+        level=numeric_level,
+        format=LOG_FORMAT,
+        handlers=handlers,
+        force=True  # Перенастраиваем, если logging уже был настроен
+    )
+
+
+# Логгер будет использовать конфигурацию из setup_logging
 logger = logging.getLogger('NotifyListener')
+
+# --- Класс слушателя ---
 
 
 class NotificationListener:
-    def __init__(self, db_uri: str, channel: str = 'do_bg_comp', max_workers: int = 5,
-                 reconnect_attempts: int = 5, reconnect_delay: float = 1.0,
-                 reconnect_backoff: float = 2.0):
+    def __init__(self, db_uri: str, channel: str = 'do_bg_comp', max_workers: int = 5):
         """
         Инициализация слушателя уведомлений.
-
         :param db_uri: URI подключения к PostgreSQL
         :param channel: имя канала для подписки
         :param max_workers: максимальное количество потоков для обработки уведомлений
-        :param reconnect_attempts: попыток подключения
-        :param reconnect_delay: задержка между попытками
-        :param reconnect_backoff:
         """
         self.db_uri = db_uri
         self.channel = channel
         self.max_workers = max_workers
-        self.reconnect_attempts = reconnect_attempts
-        self.reconnect_delay = reconnect_delay
-        self.reconnect_backoff = reconnect_backoff
         self.notification_queue = queue.Queue()
         self.workers = []
         self.running = False
         self.conn: Optional[psycopg2.extensions.connection] = None
 
-    def _handle_notification_simple(self, notification: psycopg2.extensions.Notify):
+    def _handle_notification(self, notification: psycopg2.extensions.Notify):
         """
         Обработка уведомления. Этот метод должен быть переопределен в подклассе.
-
         :param notification: объект уведомления
         """
         logger.info(f"Got notification on channel {notification.channel}: {notification.payload}")
         # Здесь должна быть ваша логика обработки уведомления
         # Пример:
         try:
-            # обработка
-            # time.sleep(10)
-            hndl_cursor = self.conn.cursor()
-            hndl_cursor.callproc('arc_energo.bg_comp',
-                                 {'arg_id': notification.payload})
-            results = hndl_cursor.fetchall()
-            logger.info(f"Processed notification: {notification.payload}, \
-            results={results}")
+            # Создаем отдельное соединение для обработчика, как обсуждалось ранее
+            # Это делает обработку более устойчивой к сбоям соединения в других частях
+            handler_conn = None
+            try:
+                handler_conn = psycopg2.connect(self.db_uri)
+                # handler_conn.set_isolation_level(...) если нужно
+                hndl_cursor = handler_conn.cursor()
+                hndl_cursor.callproc('arc_energo.bg_comp',
+                                     {'arg_id': notification.payload})
+                results = hndl_cursor.fetchall()
+                logger.info(f"Processed notification: {notification.payload}, results={results}")
+                # handler_conn.commit() если isolation level не autocommit и были изменения
+            finally:
+                if handler_conn and not handler_conn.closed:
+                    try:
+                        handler_conn.close()
+                    except (psycopg2.Error, OSError) as e:  # Исправлено: конкретные исключения
+                        logger.debug(f"Error closing handler connection: {e}", exc_info=True)
         except Exception as e:
-            logger.error(f"Error processing notification: {e}")
-
-    def _handle_notification(self, notification: psycopg2.extensions.Notify,
-                             conn: psycopg2.extensions.connection):
-        logger.info(f"Got notification on channel {notification.channel}: {notification.payload}")
-        try:
-            hndl_cursor = conn.cursor()
-            hndl_cursor.callproc('arc_energo.bg_comp', {'arg_id': notification.payload})
-            results = hndl_cursor.fetchall()  # Или fetchone() если ожидается одна запись
-            logger.info(f"Processed notification: {notification.payload}, results={results}")
-            # conn.commit() если isolation level не autocommit и были изменения
-        except Exception as e:
-            logger.error(f"Error in _handle_notification for payload {notification.payload}: {e}")
-            # Здесь можно реализовать повторную попытку, логирование или отправку в очередь DLQ
-            raise  # Перебрасываем исключение, чтобы _worker_loop мог его обработать
+            logger.error(f"Error processing notification: {e}", exc_info=True)
 
     def _worker_loop(self):
         """
@@ -91,111 +110,62 @@ class NotificationListener:
                 notification = self.notification_queue.get(timeout=1)
 
                 if notification is not None:
-                    # Создаем отдельное соединение для обработчика
-                    handler_conn = None
-                    try:
-                        handler_conn = psycopg2.connect(self.db_uri)
-                        # handler_conn.set_isolation_level(...) если нужно
-                        self._handle_notification(notification, handler_conn)  # Передаем соединение
-                    except Exception as e:
-                        logger.error(f"Error processing notification {notification.payload}: {e}")
-                        # Возможно, повторные попытки или отправка в очередь ошибок
-                    finally:
-                        if handler_conn and not handler_conn.closed:
-                            try:
-                                handler_conn.close()
-                            except (psycopg2.Error, OSError) as e:
-                                # Логируем ошибку закрытия, но не прерываем выполнение
-                                logger.debug(
-                                    f"Error closing handler connection: {e}", exc_info=True)
-                            # Или, если быть совсем точным в типах исключений:
-                            # except (psycopg2.OperationalError, psycopg2.InterfaceError,
-                            #         psycopg2.InternalError, OSError) as e:
-                            #     logger.debug(f"Error closing handler connection: {e}",
-                            # exc_info=True)
-                    # ---
+                    self._handle_notification(notification)
                 self.notification_queue.task_done()
             except queue.Empty:
                 continue
             except Exception as e:
-                logger.error(f"Worker error: {e}")
+                logger.error(f"Worker error: {e}", exc_info=True)
 
     def _listen_loop(self):
         """
         Основной цикл прослушивания уведомлений.
         """
-        # Примерная структура внутри _listen_loop
-        delay = self.reconnect_delay
+        reconnect_delay = 1.0
+        reconnect_backoff = 2.0
+        max_reconnect_delay = 60.0
 
         while self.running:
             try:
-                # --- Блок подключения ---
                 logger.info("Attempting to connect to database...")
+                # Устанавливаем соединение
                 self.conn = psycopg2.connect(self.db_uri)
                 self.conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
                 cursor = self.conn.cursor()
                 cursor.execute(f"LISTEN {self.channel};")
                 logger.info(f"Successfully connected and listening to channel '{self.channel}'...")
-                delay = self.reconnect_delay  # Сброс задержки при успешном подключении
-                # --- Конец блока подключения ---
-
-                # --- Основной цикл опроса ---
+                reconnect_delay = 1.0  # Сброс задержки при успешном подключении
 
                 while self.running:
+                    # Ожидаем уведомлений с проверкой флага running
                     self.conn.poll()  # Может выбросить исключение при разрыве
+                    # Обрабатываем все полученные уведомления
 
                     while self.conn.notifies:
                         notify = self.conn.notifies.pop(0)
                         self.notification_queue.put(notify)
                     time.sleep(0.1)  # Или используйте select/poll для более отзывчивости
-                # --- Конец цикла опроса ---
 
             except (psycopg2.OperationalError, psycopg2.InterfaceError,  # Ошибки psycopg2
-                    # Ошибки сети
-                    ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
+                    ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+                    OSError) as e:  # Исправлено: конкретные исключения
                 logger.warning(f"Database connection lost or failed: {e}")
 
                 if self.conn and not self.conn.closed:
                     try:
                         self.conn.close()
-                    except (psycopg2.Error, OSError) as e:
-                        # Логируем ошибку закрытия, но не прерываем выполнение
-                        logger.debug(f"Error closing database connection: {e}", exc_info=True)
-                    # Или, если быть совсем точным в типах исключений:
-                    # except (psycopg2.OperationalError, psycopg2.InterfaceError,
-                    #         psycopg2.InternalError, OSError) as e:
-                    #     logger.debug(f"Error closing database connection: {e}", exc_info=True)
-
+                    except (psycopg2.Error, OSError) as close_e:  # Исправлено: конкретные исключения
+                        logger.debug(
+                            f"Error closing connection during reconnect: {close_e}", exc_info=True)
                     self.conn = None
 
                 if not self.running:
                     break  # Если остановка запрошена, не пытаемся переподключиться
 
-                # Логика повтора
-                attempt = 0
-
-                while attempt < self.reconnect_attempts and self.running:
-                    logger.info(
-                        f"Reconnect attempt {attempt + 1}/{self.reconnect_attempts} \
-in {delay: .2f} seconds...")
-                    time.sleep(delay)
-                    # Сброс delay и attempt происходит только при успешном подключении выше
-                    # Ограничение максимальной задержки
-                    delay = min(delay * self.reconnect_backoff, 60.0)
-                    attempt += 1
-
-                    # Выходим из внутреннего цикла попыток, чтобы снова попытаться подключиться
-                    # во внешнем цикле
-
-                    break
-                else:
-                    if self.running:
-                        logger.error(
-                            f"Failed to reconnect after {self.reconnect_attempts} attempts. \
-Stopping listener.")
-                        self.stop()  # Или установить флаг ошибки
-
-                    break  # Останавливаем внешний цикл
+                # Логика повтора с экспоненциальной задержкой
+                logger.info(f"Reconnecting in {reconnect_delay:.2f} seconds...")
+                time.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * reconnect_backoff, max_reconnect_delay)
 
             except Exception as e:
                 logger.error(f"Unexpected error in listen loop: {e}", exc_info=True)
@@ -208,14 +178,9 @@ Stopping listener.")
                 if self.conn and not self.conn.closed:
                     try:
                         self.conn.close()
-                    except (psycopg2.Error, OSError) as e:
-                        # Логируем ошибку закрытия, но не прерываем выполнение
-                        logger.debug(f"Error closing database connection: {e}", exc_info=True)
-                    # Или, если быть совсем точным в типах исключений:
-                    # except (psycopg2.OperationalError, psycopg2.InterfaceError,
-                    #         psycopg2.InternalError, OSError) as e:
-                    #     logger.debug(f"Error closing database connection: {e}", exc_info=True)
-
+                    except (psycopg2.Error, OSError) as e:  # Исправлено: конкретные исключения
+                        logger.debug(
+                            f"Error closing database connection in finally: {e}", exc_info=True)
                     self.conn = None
 
     def start(self):
@@ -227,9 +192,7 @@ Stopping listener.")
             logger.warning("Listener is already running")
 
             return
-
         self.running = True
-
         # Запускаем рабочие потоки
 
         for i in range(self.max_workers):
@@ -241,7 +204,6 @@ Stopping listener.")
             worker.start()
             self.workers.append(worker)
             logger.info(f"Started worker thread {worker.name}")
-
         # Запускаем поток слушателя
         self.listener_thread = threading.Thread(
             target=self._listen_loop,
@@ -258,9 +220,8 @@ Stopping listener.")
 
         if not self.running:
             return
-
-        self.running = False
         logger.info("Stopping listener...")
+        self.running = False
 
         # Ожидаем завершения потока слушателя
 
@@ -269,7 +230,6 @@ Stopping listener.")
 
             if self.listener_thread.is_alive():
                 logger.warning("Listener thread did not stop gracefully")
-
         # Ожидаем завершения рабочих потоков
 
         for worker in self.workers:
@@ -278,12 +238,13 @@ Stopping listener.")
 
                 if worker.is_alive():
                     logger.warning(f"Worker thread {worker.name} did not stop gracefully")
-
-        # Закрываем соединение, если оно еще открыто
+        # Закрываем соединение, если оно еще открыто (на всякий случай)
 
         if self.conn and not self.conn.closed:
-            self.conn.close()
-
+            try:
+                self.conn.close()
+            except (psycopg2.Error, OSError) as e:  # Исправлено: конкретные исключения
+                logger.debug(f"Error closing connection in stop: {e}", exc_info=True)
         logger.info("Listener stopped")
 
     def __enter__(self):
@@ -294,17 +255,80 @@ Stopping listener.")
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.stop()
 
+# --- Функция разбора аргументов командной строки ---
+
+
+def parse_arguments():
+    """Парсит аргументы командной строки."""
+    parser = argparse.ArgumentParser(
+        description="Слушатель уведомлений PostgreSQL (LISTEN/NOTIFY).",
+        formatter_class=argparse.RawTextHelpFormatter  # Для корректного отображения \n в help
+    )
+
+    parser.add_argument(
+        '--db-uri', '-d',
+        type=str,
+        required=True,  # Сделаем обязательным
+        help='URI подключения к PostgreSQL.\nПример: postgresql://user:password@host:port/database'
+    )
+
+    parser.add_argument(
+        '--log-level', '-l',
+        type=str,
+        default='INFO',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+        help='Уровень логирования. По умолчанию: INFO'
+    )
+
+    parser.add_argument(
+        '--log-file', '-f',
+        type=str,
+        default=None,
+        help='Путь к файлу лога. Если не указан, логи выводятся в консоль (stdout).'
+    )
+
+    parser.add_argument(
+        '--channel', '-c',
+        type=str,
+        default='do_bg_comp',
+        help='Имя канала PostgreSQL для LISTEN. По умолчанию: do_bg_comp'
+    )
+
+    parser.add_argument(
+        '--workers', '-w',
+        type=int,
+        default=5,
+        help='Количество рабочих потоков для обработки уведомлений. По умолчанию: 5'
+    )
+
+    return parser.parse_args()
+
+
+# --- Основная точка входа ---
 
 if __name__ == "__main__":
-    # Пример использования
-    DB_URI = "postgresql://arc_energo@vm-pg-clone/arc_energo"
+    # 1. Парсим аргументы
+    args = parse_arguments()
 
-    # Создаем и запускаем слушатель
-    listener = NotificationListener(db_uri=DB_URI, max_workers=10)
+    # 2. Настраиваем логирование
+    try:
+        setup_logging(args.log_level, args.log_file)
+        logger.info("Logging configured.")
+    except Exception as e:
+        print(f"Failed to configure logging: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # 3. Создаем и запускаем слушатель
+    listener = NotificationListener(
+        db_uri=args.db_uri,
+        channel=args.channel,
+        max_workers=args.workers
+    )
 
     try:
         listener.start()
-        logger.info("Notification listener started. Press Ctrl+C to stop.")
+        logger.info(
+            f"Notification listener started for channel '{args.channel}'. Press Ctrl+C to stop.")
 
         while True:
             time.sleep(1)
